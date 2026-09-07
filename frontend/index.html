@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>LeadGenAI</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            background: #0f1117;
+            color: #f5f5f5;
+            min-height: 100vh;
+        }
+
+        .container {
+            width: 90%;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 40px 0;
+        }
+
+        header {
+            margin-bottom: 40px;
+        }
+
+        header h1 {
+            font-size: 36px;
+            margin-bottom: 8px;
+        }
+
+        header p {
+            color: #9ca3af;
+            font-size: 16px;
+        }
+
+        .search-box {
+            background: #181b23;
+            border: 1px solid #292e3a;
+            border-radius: 14px;
+            padding: 24px;
+            margin-bottom: 30px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 10px;
+            font-weight: bold;
+        }
+
+        .input-row {
+            display: flex;
+            gap: 12px;
+        }
+
+        input {
+            flex: 1;
+            padding: 14px 16px;
+            border-radius: 9px;
+            border: 1px solid #343a46;
+            background: #101218;
+            color: white;
+            font-size: 15px;
+            outline: none;
+        }
+
+        input:focus {
+            border-color: #6366f1;
+        }
+
+        button {
+            padding: 14px 24px;
+            border: none;
+            border-radius: 9px;
+            background: #6366f1;
+            color: white;
+            font-size: 15px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #4f46e5;
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        #status {
+            margin: 20px 0;
+            color: #9ca3af;
+        }
+
+        .error {
+            color: #f87171 !important;
+        }
+
+        .results-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .results-header h2 {
+            font-size: 24px;
+        }
+
+        #count {
+            color: #9ca3af;
+        }
+
+        .leads {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 20px;
+        }
+
+        .lead-card {
+            background: #181b23;
+            border: 1px solid #292e3a;
+            border-radius: 14px;
+            padding: 22px;
+        }
+
+        .lead-card h3 {
+            font-size: 21px;
+            margin-bottom: 8px;
+        }
+
+        .industry {
+            display: inline-block;
+            background: #252a3a;
+            color: #a5b4fc;
+            padding: 5px 9px;
+            border-radius: 6px;
+            font-size: 12px;
+            margin-bottom: 16px;
+        }
+
+        .lead-card p {
+            color: #c4c7ce;
+            line-height: 1.6;
+            margin-bottom: 14px;
+        }
+
+        .section-title {
+            color: #fff;
+            font-weight: bold;
+            margin-bottom: 6px;
+        }
+
+        .services {
+            margin-top: 10px;
+        }
+
+        .service {
+            color: #b7bbc5;
+            margin: 5px 0;
+        }
+
+        .source {
+            display: inline-block;
+            margin-top: 12px;
+            color: #818cf8;
+            text-decoration: none;
+            font-size: 14px;
+        }
+
+        .source:hover {
+            text-decoration: underline;
+        }
+
+        .empty {
+            text-align: center;
+            padding: 60px;
+            color: #6b7280;
+        }
+
+        @media (max-width: 700px) {
+            .input-row {
+                flex-direction: column;
+            }
+
+            button {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+
+        <header>
+            <h1>⚡ LeadGenAI</h1>
+            <p>Autonomous AI-powered lead discovery and research.</p>
+        </header>
+
+        <section class="search-box">
+
+            <label for="criteria">
+                What kind of leads do you want to find?
+            </label>
+
+            <div class="input-row">
+
+                <input id="criteria" type="text" placeholder="e.g. AI automation companies in India">
+
+                <button id="findButton" onclick="findLeads()">
+                    Find Leads
+                </button>
+
+            </div>
+
+        </section>
+
+        <div id="status"></div>
+
+        <section>
+
+            <div class="results-header">
+                <h2>Leads</h2>
+                <span id="count"></span>
+            </div>
+
+            <div id="leads" class="leads">
+
+                <div class="empty">
+                    Enter your criteria and find some leads.
+                </div>
+
+            </div>
+
+        </section>
+
+    </div>
+
+
+    <script>
+
+        const API_URL = "http://127.0.0.1:8000";
+
+
+        async function findLeads() {
+
+            const criteriaInput = document.getElementById("criteria");
+            const button = document.getElementById("findButton");
+            const status = document.getElementById("status");
+            const leadsContainer = document.getElementById("leads");
+            const count = document.getElementById("count");
+
+            const criteria = criteriaInput.value.trim();
+
+            if (!criteria) {
+                status.textContent = "Please enter what kind of leads you want.";
+                status.className = "error";
+                return;
+            }
+
+            button.disabled = true;
+            button.textContent = "Finding...";
+
+            status.className = "";
+            status.textContent = "🔎 Searching the web and researching potential leads...";
+
+            leadsContainer.innerHTML = "";
+            count.textContent = "";
+
+            try {
+
+                const response = await fetch(
+                    `${API_URL}/generate-leads`,
+                    {
+                        method: "POST",
+
+                        headers: {
+                            "Content-Type": "application/json"
+                        },
+
+                        body: JSON.stringify({
+                            criteria: criteria,
+                            max_results: 5
+                        })
+                    }
+                );
+
+                if (!response.ok) {
+                    throw new Error(
+                        `API returned ${response.status}`
+                    );
+                }
+
+                const data = await response.json();
+
+                displayLeads(data.leads || []);
+
+                status.textContent =
+                    `✓ Finished researching ${data.leads?.length || 0} lead(s).`;
+
+                count.textContent =
+                    `${data.leads?.length || 0} found`;
+
+            } catch (error) {
+
+                console.error(error);
+
+                status.className = "error";
+
+                status.textContent =
+                    "❌ Could not connect to LeadGenAI API. Is FastAPI running?";
+
+                leadsContainer.innerHTML = `
+            <div class="empty">
+                Make sure the API is running on port 8000.
+            </div>
+        `;
+
+            } finally {
+
+                button.disabled = false;
+                button.textContent = "Find Leads";
+
+            }
+        }
+
+
+        function displayLeads(leads) {
+
+            const container = document.getElementById("leads");
+
+            if (!leads.length) {
+
+                container.innerHTML = `
+            <div class="empty">
+                No matching leads were found.
+            </div>
+        `;
+
+                return;
+            }
+
+            container.innerHTML = leads.map(lead => {
+
+                const services =
+                    lead.products_or_services || [];
+
+                const opportunities =
+                    lead.potential_service_opportunities || [];
+
+                const source =
+                    lead.sources?.[0];
+
+                return `
+
+            <article class="lead-card">
+
+                <h3>${escapeHtml(
+                    lead.company_name || "Unknown Company"
+                )}</h3>
+
+                <span class="industry">
+                    ${escapeHtml(
+                    lead.industry || "Unknown industry"
+                )}
+                </span>
+
+                <div>
+                    <div class="section-title">
+                        Company
+                    </div>
+
+                    <p>
+                        ${escapeHtml(
+                    lead.company_summary || ""
+                )}
+                    </p>
+                </div>
+
+                ${services.length
+                        ? `
+                        <div class="services">
+                            <div class="section-title">
+                                Services
+                            </div>
+
+                            ${services.map(service => `
+                                <div class="service">
+                                    • ${escapeHtml(service)}
+                                </div>
+                            `).join("")}
+                        </div>
+                    `
+                        : ""
+                    }
+
+                ${opportunities.length
+                        ? `
+                        <div class="services">
+                            <div class="section-title">
+                                Potential Opportunities
+                            </div>
+
+                            ${opportunities.slice(0, 3).map(opportunity => `
+                                <div class="service">
+                                    • ${escapeHtml(opportunity)}
+                                </div>
+                            `).join("")}
+                        </div>
+                    `
+                        : ""
+                    }
+
+                ${source
+                        ? `
+                        <a
+                            class="source"
+                            href="${escapeAttribute(source.url)}"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                        >
+                            View source →
+                        </a>
+                    `
+                        : ""
+                    }
+
+            </article>
+
+        `;
+
+            }).join("");
+        }
+
+
+        function escapeHtml(value) {
+
+            return String(value)
+                .replaceAll("&", "&amp;")
+                .replaceAll("<", "&lt;")
+                .replaceAll(">", "&gt;")
+                .replaceAll('"', "&quot;")
+                .replaceAll("'", "&#039;");
+        }
+
+
+        function escapeAttribute(value) {
+
+            return escapeHtml(value);
+        }
+
+
+        document
+            .getElementById("criteria")
+            .addEventListener("keydown", event => {
+
+                if (event.key === "Enter") {
+                    findLeads();
+                }
+
+            });
+
+    </script>
+
+</body>
+
+</html>
