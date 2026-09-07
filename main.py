@@ -1,45 +1,40 @@
-from agents.lead_researcher import research_lead
-from database.database import init_db, save_lead, get_leads
+from core.orchestrator import run_lead_generation
+from database.database import init_db, get_leads
 
 
 def main():
-    # Make sure the database exists
     init_db()
 
     while True:
         print("\n=== LeadGenAI ===")
-        print("1. Research new lead")
+        print("1. Find and research leads")
         print("2. View saved leads")
         print("3. Exit")
 
         choice = input("\nChoose an option: ").strip()
 
         if choice == "1":
-            company_name = input("Company name: ").strip()
-            industry = input("Industry: ").strip()
-            company_info = input("What does the company do? ").strip()
+            criteria = input(
+                "\nWhat kind of leads do you want to find?\n> "
+            ).strip()
 
-            lead_info = (
-                f"Company: {company_name}\n"
-                f"Industry: {industry}\n"
-                f"What they do: {company_info}"
-            )
+            if not criteria:
+                print("\nPlease enter some criteria.")
+                continue
 
-            print("\nResearching lead...\n")
+            try:
+                leads = run_lead_generation(
+                    criteria,
+                    max_results=5,
+                )
 
-            research = research_lead(lead_info)
+                print(
+                    f"\nCompleted. "
+                    f"{len(leads)} lead(s) processed."
+                )
 
-            print("=== Research Result ===")
-            print(research)
-
-            save_lead(
-                company_name,
-                industry,
-                company_info,
-                research
-            )
-
-            print("\nLead saved successfully!")
+            except Exception as exc:
+                print(f"\nLead generation failed: {exc}")
 
         elif choice == "2":
             leads = get_leads()
