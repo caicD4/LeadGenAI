@@ -1,6 +1,6 @@
 import json
 
-from config.ollama_client import ask_ai
+from config.ollama_client import ask_ai, clean_json_response
 from tools.web_search import search_web
 
 
@@ -19,7 +19,7 @@ IMPORTANT:
 - Every factual claim must be supported by the search results.
 - If information is not available, use an empty string or empty array.
 - Clearly separate factual observations from potential opportunities.
-- Return ONLY valid JSON.
+- Return ONLY valid JSON — no markdown, no explanation, no code fences.
 
 Use exactly this structure:
 
@@ -57,12 +57,13 @@ Rules:
 - sources must contain the URLs used as evidence.
 - Do not fabricate URLs.
 - Return no explanation outside the JSON.
+- Do NOT wrap your response in markdown code fences.
 """
 
 
 def research_lead(lead: dict) -> str:
     """
-    Research a specific lead using additional web searches.
+    Research a specific lead using a focused web search + AI analysis.
     """
 
     company_name = lead.get("company_name", "")
@@ -74,25 +75,22 @@ def research_lead(lead: dict) -> str:
             "error": "company_name is required"
         })
 
-    search_queries = [
-        f"{company_name} company",
-        f"{company_name} products services",
-        f"{company_name} customers industry",
-    ]
+    # ── Web Search ─────────────────────────────────────────────────────────
+    # Use a single, focused query to reduce API calls and latency.
+    # Previously this made 3 separate queries (9 results) per lead —
+    # now it makes 1 broader query (5 results).
+    search_query = f"{company_name} {industry} company overview products services"
 
-    all_results = []
+    print(f"[LeadResearcher] Searching for: {search_query!r}")
 
-    for query in search_queries:
-        results = search_web(query, max_results=3)
+    results = search_web(search_query, max_results=5)
 
-        if results:
-            all_results.extend(results)
-
-    if not all_results:
+    if not results:
+        print(f"[LeadResearcher] No results for '{company_name}', returning stub.")
         return json.dumps({
             "company_name": company_name,
             "industry": industry,
-            "company_summary": "",
+            "company_summary": company_info,
             "products_or_services": [],
             "target_customers": [],
             "business_problems_or_needs": [],
@@ -101,11 +99,11 @@ def research_lead(lead: dict) -> str:
             "sources": []
         })
 
-    # Remove duplicate search results.
+    # Remove duplicate URLs just in case.
     unique_results = []
-    seen_urls = set()
+    seen_urls: set[str] = set()
 
-    for result in all_results:
+    for result in results:
         url = result.get("url")
 
         if url and url not in seen_urls:
@@ -114,6 +112,7 @@ def research_lead(lead: dict) -> str:
 
     results_text = json.dumps(unique_results, indent=2)
 
+    # ── AI Analysis ────────────────────────────────────────────────────────
     prompt = f"""
 {SYSTEM_PROMPT}
 
@@ -125,13 +124,18 @@ Lead to research:
     "company_info": company_info
 }, indent=2)}
 
-Additional web research:
+Web research results:
 
 {results_text}
 
 Research this company using ONLY the provided evidence.
 
-Return ONLY the JSON object.
+Return ONLY the JSON object. Do NOT use markdown code fences.
 """
 
-    return ask_ai(prompt)
+    print(f"[LeadResearcher] Sending research prompt for '{company_name}' to AI...")
+    raw = ask_ai(prompt)
+    print(f"[LeadResearcher] AI responded for '{company_name}' ({len(raw)} chars).")
+
+    # Strip markdown code fences before returning.
+    return clean_json_response(raw)

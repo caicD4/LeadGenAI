@@ -1,5 +1,19 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
-database/*.db
+*.pyo
+*.pyd
+
+# Environment & secrets
 .env
+
+# Database
+database/*.db
+
+# Test / scratch files (never commit these)
+test_*.py
+
+# Editor
+.vscode/
+*.swp

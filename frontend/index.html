@@ -231,8 +231,11 @@
         <section>
 
             <div class="results-header">
+
                 <h2>Leads</h2>
+
                 <span id="count"></span>
+
             </div>
 
             <div id="leads" class="leads">
@@ -255,30 +258,59 @@
 
         async function findLeads() {
 
-            const criteriaInput = document.getElementById("criteria");
-            const button = document.getElementById("findButton");
-            const status = document.getElementById("status");
-            const leadsContainer = document.getElementById("leads");
-            const count = document.getElementById("count");
+            const criteriaInput =
+                document.getElementById("criteria");
 
-            const criteria = criteriaInput.value.trim();
+            const button =
+                document.getElementById("findButton");
+
+            const status =
+                document.getElementById("status");
+
+            const leadsContainer =
+                document.getElementById("leads");
+
+            const count =
+                document.getElementById("count");
+
+
+            const criteria =
+                criteriaInput.value.trim();
+
 
             if (!criteria) {
-                status.textContent = "Please enter what kind of leads you want.";
+
+                status.textContent =
+                    "Please enter what kind of leads you want.";
+
                 status.className = "error";
+
                 return;
             }
 
+
+            // Disable button while job is running
             button.disabled = true;
+
             button.textContent = "Finding...";
 
+
             status.className = "";
-            status.textContent = "🔎 Searching the web and researching potential leads...";
+
+            status.textContent =
+                "Starting lead generation...";
+
 
             leadsContainer.innerHTML = "";
+
             count.textContent = "";
 
+
             try {
+
+                // ==================================================
+                // 1. CREATE BACKGROUND JOB
+                // ==================================================
 
                 const response = await fetch(
                     `${API_URL}/generate-leads`,
@@ -296,180 +328,481 @@
                     }
                 );
 
+
                 if (!response.ok) {
+
                     throw new Error(
-                        `API returned ${response.status}`
+                        `Failed to create job. HTTP ${response.status}`
                     );
+
                 }
 
-                const data = await response.json();
 
-                displayLeads(data.leads || []);
+                const data =
+                    await response.json();
 
-                status.textContent =
-                    `✓ Finished researching ${data.leads?.length || 0} lead(s).`;
 
-                count.textContent =
-                    `${data.leads?.length || 0} found`;
+                console.log(
+                    "POST /generate-leads response:",
+                    data
+                );
+
+
+                const jobId =
+                    data.job_id;
+
+
+                if (!jobId) {
+
+                    throw new Error(
+                        "Server did not return a job ID."
+                    );
+
+                }
+
+
+                console.log(
+                    "Job ID:",
+                    jobId
+                );
+
+
+                // ==================================================
+                // 2. POLL JOB UNTIL COMPLETED
+                // ==================================================
+
+                let jobData;
+
+
+                while (true) {
+
+                    // Wait 2 seconds between polls
+                    await new Promise(
+                        resolve => setTimeout(resolve, 2000)
+                    );
+
+
+                    try {
+
+                        const jobResponse =
+                            await fetch(
+                                `${API_URL}/jobs/${jobId}`
+                            );
+
+
+                        if (!jobResponse.ok) {
+
+                            if (jobResponse.status === 404) {
+
+                                throw new Error(
+                                    "Job was not found on the server. " +
+                                    "The backend may have restarted."
+                                );
+
+                            }
+
+
+                            throw new Error(
+                                `Job status request failed. HTTP ${jobResponse.status}`
+                            );
+
+                        }
+
+
+                        jobData =
+                            await jobResponse.json();
+
+
+                    } catch (pollError) {
+
+                        console.error(
+                            "Polling error:",
+                            pollError
+                        );
+
+
+                        status.className = "error";
+
+                        status.textContent =
+                            `⚠️ Polling error: ${pollError.message}. Retrying...`;
+
+
+                        // Don't destroy the job because of one
+                        // temporary polling failure.
+                        await new Promise(
+                            resolve => setTimeout(resolve, 3000)
+                        );
+
+                        continue;
+
+                    }
+
+
+                    console.log(
+                        "Job status:",
+                        jobData
+                    );
+
+
+                    // ==================================================
+                    // 3. SHOW LIVE PROGRESS
+                    // ==================================================
+
+                    const progress =
+                        jobData.progress ?? 0;
+
+                    const message =
+                        jobData.message || "Working...";
+
+
+                    status.className = "";
+
+                    status.textContent =
+                        `${message} (${progress}%)`;
+
+
+                    // ==================================================
+                    // 4. JOB COMPLETED
+                    // ==================================================
+
+                    if (
+                        jobData.status === "completed"
+                    ) {
+
+                        console.log(
+                            "JOB COMPLETED:",
+                            jobData
+                        );
+
+
+                        const leads =
+                            Array.isArray(jobData.leads)
+                                ? jobData.leads
+                                : [];
+
+
+                        displayLeads(leads);
+
+
+                        status.textContent =
+                            `✓ Finished researching ${leads.length} lead(s).`;
+
+
+                        count.textContent =
+                            `${leads.length} found`;
+
+
+                        break;
+
+                    }
+
+
+                    // ==================================================
+                    // 5. JOB FAILED
+                    // ==================================================
+
+                    if (
+                        jobData.status === "failed"
+                    ) {
+
+                        throw new Error(
+                            jobData.message ||
+                            "Lead generation failed."
+                        );
+
+                    }
+
+
+                    // ==================================================
+                    // 6. queued / running
+                    //
+                    // Nothing else to do.
+                    // Loop continues and checks again.
+                    // ==================================================
+
+                }
+
 
             } catch (error) {
 
-                console.error(error);
+                console.error(
+                    "Lead generation error:",
+                    error
+                );
+
 
                 status.className = "error";
 
+
                 status.textContent =
-                    "❌ Could not connect to LeadGenAI API. Is FastAPI running?";
+                    `❌ ${error.message}`;
+
 
                 leadsContainer.innerHTML = `
-            <div class="empty">
-                Make sure the API is running on port 8000.
-            </div>
-        `;
+                    <div class="empty">
+                        Lead generation failed.
+                        Check the FastAPI terminal for details.
+                    </div>
+                `;
+
 
             } finally {
 
+                // Only runs AFTER the job has completed
+                // or genuinely failed.
+
                 button.disabled = false;
+
                 button.textContent = "Find Leads";
 
             }
+
         }
 
+
+        // ==========================================================
+        // DISPLAY LEADS
+        // ==========================================================
 
         function displayLeads(leads) {
 
-            const container = document.getElementById("leads");
+            const container =
+                document.getElementById("leads");
 
-            if (!leads.length) {
+
+            if (
+                !Array.isArray(leads) ||
+                leads.length === 0
+            ) {
 
                 container.innerHTML = `
-            <div class="empty">
-                No matching leads were found.
-            </div>
-        `;
+                    <div class="empty">
+                        No matching leads were found.
+                    </div>
+                `;
 
                 return;
+
             }
 
-            container.innerHTML = leads.map(lead => {
 
-                const services =
-                    lead.products_or_services || [];
+            container.innerHTML =
+                leads.map(lead => {
 
-                const opportunities =
-                    lead.potential_service_opportunities || [];
+                    const services =
+                        Array.isArray(
+                            lead.products_or_services
+                        )
+                            ? lead.products_or_services
+                            : [];
 
-                const source =
-                    lead.sources?.[0];
 
-                return `
+                    const opportunities =
+                        Array.isArray(
+                            lead.potential_service_opportunities
+                        )
+                            ? lead.potential_service_opportunities
+                            : [];
 
-            <article class="lead-card">
 
-                <h3>${escapeHtml(
-                    lead.company_name || "Unknown Company"
-                )}</h3>
+                    const source =
+                        Array.isArray(lead.sources)
+                            ? lead.sources[0]
+                            : null;
 
-                <span class="industry">
-                    ${escapeHtml(
-                    lead.industry || "Unknown industry"
-                )}
-                </span>
 
-                <div>
-                    <div class="section-title">
-                        Company
-                    </div>
+                    return `
 
-                    <p>
-                        ${escapeHtml(
-                    lead.company_summary || ""
-                )}
-                    </p>
-                </div>
+                        <article class="lead-card">
 
-                ${services.length
-                        ? `
-                        <div class="services">
-                            <div class="section-title">
-                                Services
+                            <h3>
+                                ${escapeHtml(
+                        lead.company_name ||
+                        "Unknown Company"
+                    )}
+                            </h3>
+
+
+                            <span class="industry">
+
+                                ${escapeHtml(
+                        lead.industry ||
+                        "Unknown industry"
+                    )}
+
+                            </span>
+
+
+                            <div>
+
+                                <div class="section-title">
+                                    Company
+                                </div>
+
+
+                                <p>
+
+                                    ${escapeHtml(
+                        lead.company_summary ||
+                        ""
+                    )}
+
+                                </p>
+
                             </div>
 
-                            ${services.map(service => `
-                                <div class="service">
-                                    • ${escapeHtml(service)}
-                                </div>
-                            `).join("")}
-                        </div>
-                    `
-                        : ""
-                    }
 
-                ${opportunities.length
-                        ? `
-                        <div class="services">
-                            <div class="section-title">
-                                Potential Opportunities
-                            </div>
+                            ${services.length
+                            ? `
 
-                            ${opportunities.slice(0, 3).map(opportunity => `
-                                <div class="service">
-                                    • ${escapeHtml(opportunity)}
-                                </div>
-                            `).join("")}
-                        </div>
-                    `
-                        : ""
-                    }
+                                    <div class="services">
 
-                ${source
-                        ? `
-                        <a
-                            class="source"
-                            href="${escapeAttribute(source.url)}"
-                            target="_blank"
-                            rel="noopener noreferrer"
-                        >
-                            View source →
-                        </a>
-                    `
-                        : ""
-                    }
+                                        <div class="section-title">
+                                            Services
+                                        </div>
 
-            </article>
 
-        `;
+                                        ${services
+                                .map(service => `
 
-            }).join("");
+                                                <div class="service">
+
+                                                    • ${escapeHtml(
+                                    service
+                                )}
+
+                                                </div>
+
+                                            `)
+                                .join("")}
+
+                                    </div>
+
+                                    `
+                            : ""
+                        }
+
+
+                            ${opportunities.length
+                            ? `
+
+                                    <div class="services">
+
+                                        <div class="section-title">
+                                            Potential Opportunities
+                                        </div>
+
+
+                                        ${opportunities
+                                .slice(0, 3)
+                                .map(opportunity => `
+
+                                                <div class="service">
+
+                                                    • ${escapeHtml(
+                                    opportunity
+                                )}
+
+                                                </div>
+
+                                            `)
+                                .join("")}
+
+                                    </div>
+
+                                    `
+                            : ""
+                        }
+
+
+                            ${source && source.url
+                            ? `
+
+                                    <a
+                                        class="source"
+                                        href="${escapeAttribute(
+                                source.url
+                            )}"
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                    >
+                                        View source →
+                                    </a>
+
+                                    `
+                            : ""
+                        }
+
+                        </article>
+
+                    `;
+
+                }).join("");
+
         }
 
+
+        // ==========================================================
+        // HTML ESCAPING
+        // ==========================================================
 
         function escapeHtml(value) {
 
             return String(value)
-                .replaceAll("&", "&amp;")
-                .replaceAll("<", "&lt;")
-                .replaceAll(">", "&gt;")
-                .replaceAll('"', "&quot;")
-                .replaceAll("'", "&#039;");
+
+                .replaceAll(
+                    "&",
+                    "&amp;"
+                )
+
+                .replaceAll(
+                    "<",
+                    "&lt;"
+                )
+
+                .replaceAll(
+                    ">",
+                    "&gt;"
+                )
+
+                .replaceAll(
+                    '"',
+                    "&quot;"
+                )
+
+                .replaceAll(
+                    "'",
+                    "&#039;"
+                );
+
         }
 
 
         function escapeAttribute(value) {
 
             return escapeHtml(value);
+
         }
 
 
+        // ==========================================================
+        // ENTER KEY SUPPORT
+        // ==========================================================
+
         document
             .getElementById("criteria")
-            .addEventListener("keydown", event => {
+            .addEventListener(
+                "keydown",
+                event => {
 
-                if (event.key === "Enter") {
-                    findLeads();
+                    if (event.key === "Enter") {
+
+                        findLeads();
+
+                    }
+
                 }
-
-            });
+            );
 
     </script>
 
