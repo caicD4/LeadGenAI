@@ -16,4 +16,4 @@ test_*.py
 
 # Editor
 .vscode/
-*.swp
+*.swp.env
