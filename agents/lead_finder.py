@@ -1,168 +1,109 @@
+"""
+LeadGenAI — Lead Finder.
+
+Discovery pipeline:
+  1. Build 2–3 targeted search queries from user criteria.
+  2. Run multi_search (deduplicates by URL).
+  3. Gemini extracts candidate companies with name + website + evidence.
+  4. Normalize domains, deduplicate companies.
+  5. Check DB for already-researched companies -> flag as cached.
+  6. Research each new candidate (lead_researcher).
+  7. Detect opportunities (opportunity_detector).
+  8. Score each lead (lead_scorer).
+  9. Return final list of enriched lead dicts.
+"""
+
 import json
+import re
+import traceback
 from typing import Callable, List, Optional
 
 from pydantic import BaseModel, Field, ValidationError
 
 from agents.lead_researcher import research_lead
-from config.ollama_client import ask_ai, clean_json_response
-from tools.web_search import search_web
+from agents.lead_scorer import score_lead
+from agents.opportunity_detector import detect_opportunities
+from config.ollama_client import ask_ai_json, clean_json_response
+from database.database import (
+    get_company_by_domain,
+    normalize_domain,
+    save_full_lead,
+    upsert_company,
+)
+from tools.web_search import WebSearchError, multi_search
 
 
-class Lead(BaseModel):
+# ---------------------------------------------------------------------------
+# Pydantic models for candidate validation
+# ---------------------------------------------------------------------------
+
+class Candidate(BaseModel):
     company_name: str = Field(min_length=1)
-    industry: str = Field(min_length=1)
-    company_info: str = Field(min_length=1)
-    source_url: str = Field(min_length=1)
-    source_title: str = Field(min_length=1)
-    evidence: str = Field(min_length=1)
+    industry:     str = Field(default="")
+    website:      str = Field(default="")
+    company_info: str = Field(default="")
+    source_url:   str = Field(default="")
+    source_title: str = Field(default="")
+    evidence:     str = Field(default="")
 
 
-class LeadFinderResult(BaseModel):
-    leads: List[Lead]
+class CandidateList(BaseModel):
+    leads: List[Candidate]
 
 
-SYSTEM_PROMPT = """
+# ---------------------------------------------------------------------------
+# Discovery prompt
+# ---------------------------------------------------------------------------
+
+DISCOVERY_PROMPT = """
 You are the Lead Finder for LeadGenAI.
 
-Your job is to identify potential business leads (companies) from the provided web search results.
+Your job is to extract named, real companies from web search results that
+match the user's lead criteria.
 
-The user's criteria may be:
-- A type of business or industry (e.g. "medspa", "accounting firm", "SaaS startup")
-- A location + industry combination (e.g. "AI companies in India")
-- A specific niche or vertical
-
-Your goal is to find real, named companies that match the criteria.
-
-IMPORTANT:
-- Use the search results as your primary evidence.
-- You MAY use your general knowledge to fill in well-known company names if they
-  are clearly referenced or implied by the search results.
-- Do NOT invent companies that have no basis in the results.
-- Every lead must have all six required fields.
-- Return ONLY valid JSON — no markdown, no explanation, no code fences.
+RULES:
+- Use search results as the primary evidence source.
+- You may use general knowledge for well-known companies referenced or
+  implied by the results.
+- Do NOT invent companies with no basis in the results.
+- Each entry must have a company_name.
+- website should be the company's actual homepage URL if you can determine it;
+  otherwise leave it empty.
+- source_url must be a URL from the provided search results.
+- evidence: one sentence explaining why this company matches the criteria.
+- Return ONLY valid JSON. No markdown. No code fences.
 
 Required structure:
-
 {
-    "leads": [
-        {
-            "company_name": "",
-            "industry": "",
-            "company_info": "",
-            "source_url": "",
-            "source_title": "",
-            "evidence": ""
-        }
-    ]
+  "leads": [
+    {
+      "company_name": "",
+      "industry":     "",
+      "website":      "",
+      "company_info": "",
+      "source_url":   "",
+      "source_title": "",
+      "evidence":     ""
+    }
+  ]
 }
-
-Rules:
-- "leads" must be an array.
-- Every lead must contain all six fields with non-empty values.
-- company_name: the actual business name.
-- industry: what sector/niche they operate in.
-- company_info: a brief factual description of the company.
-- source_url: a URL from the search results that references this company.
-- source_title: the title of that page.
-- evidence: one sentence explaining why this company matches the user's criteria.
-- Do NOT wrap your response in markdown code fences.
-- Return no explanation outside the JSON.
 """
 
 
-def find_leads(
-    criteria: str,
-    max_results: int = 10,
-    on_progress: Optional[Callable[[str], None]] = None,
-) -> str:
-    """
-    Discover potential leads using web search and AI analysis,
-    then validate the AI output against the Lead schema.
-    """
-
-    if on_progress:
-        on_progress("Searching the web for leads...")
-
-    print(f"[LeadFinder] Searching for: {criteria!r}")
-
-    # Build a richer search query — single-word terms like "medspa" need
-    # context to find company listings rather than general info pages.
-    search_query = criteria
-    if len(criteria.split()) == 1:
-        search_query = f"best {criteria} companies list top businesses"
-
-    search_results = search_web(
-        search_query,
-        max_results=max_results,
-    )
-
-    if not search_results:
-        print("[LeadFinder] No web search results found.")
-        return json.dumps({"leads": []})
-
-    print(f"[LeadFinder] Got {len(search_results)} search result(s).")
-
-    if on_progress:
-        on_progress(f"Found {len(search_results)} search results. Analysing with AI...")
-
-    results_text = json.dumps(
-        search_results,
-        indent=2,
-    )
-
-    prompt = f"""
-{SYSTEM_PROMPT}
-
-User's lead criteria:
-
-{criteria}
-
-Real web search results:
-
-{results_text}
-
-Analyze the search results and identify the best matching leads.
-
-Return ONLY the JSON object. Do NOT use markdown code fences.
-"""
-
-    print("[LeadFinder] Sending prompt to AI...")
-    raw_response = ask_ai(prompt)
-    print(f"[LeadFinder] AI responded ({len(raw_response)} chars).")
-
-    # Strip any markdown code fences the model may have added.
-    cleaned = clean_json_response(raw_response)
-
-    try:
-        parsed = json.loads(cleaned)
-        validated = LeadFinderResult.model_validate(parsed)
-
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Lead Finder returned invalid JSON: {exc}\n"
-            f"Raw AI response (first 500 chars): {raw_response[:500]}"
-        ) from exc
-
-    except ValidationError as exc:
-        raise ValueError(
-            f"Lead Finder returned structurally invalid data: {exc}"
-        ) from exc
-
-    return validated.model_dump_json(indent=2)
-
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 def find_and_research_leads(
     criteria: str,
     max_results: int = 5,
+    job_id: str = None,
     on_progress: Optional[Callable[[str, int], None]] = None,
 ) -> list[dict]:
     """
-    Find candidate leads and research each one.
+    Full pipeline: discover -> deduplicate -> research -> score -> detect opportunities.
 
-    Args:
-        criteria:    Natural-language search criteria.
-        max_results: How many leads to discover.
-        on_progress: Optional callback(message, progress_pct) for status updates.
+    Returns a list of enriched lead dicts ready to be stored and served to the frontend.
     """
 
     def _notify(msg: str, pct: int = None):
@@ -170,71 +111,264 @@ def find_and_research_leads(
         if on_progress:
             on_progress(msg, pct)
 
-    # ── Step 1: Find leads ────────────────────────────────────────────────
-    _notify("Discovering leads via web search...", 20)
+    # ── Step 1: Multi-query discovery ─────────────────────────────────────
+    _notify("Building search queries...", 15)
+    queries = _build_discovery_queries(criteria)
+    print(f"[LeadFinder] Queries: {queries}")
 
-    raw_leads = find_leads(
-        criteria,
-        max_results=max_results,
-        on_progress=lambda msg: _notify(msg),
-    )
-
+    _notify("Searching the web for companies...", 20)
     try:
-        lead_data = json.loads(raw_leads)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            "Lead Finder returned invalid JSON."
-        ) from exc
-
-    leads = lead_data.get("leads", [])
-
-    if not leads:
-        _notify("No leads discovered.", 90)
+        search_results = multi_search(queries, max_results_per_query=5)
+    except WebSearchError as exc:
+        print(f"[LeadFinder] Web search failed: {exc}")
+        _notify(f"Web search failed: {exc}", 20)
         return []
 
-    # Cap to max_results — the AI sometimes returns more than requested.
-    if len(leads) > max_results:
-        print(
-            f"[LeadFinder] AI returned {len(leads)} leads; "
-            f"capping to max_results={max_results}."
-        )
-        leads = leads[:max_results]
+    if not search_results:
+        _notify("No search results found.", 25)
+        return []
 
-    _notify(f"Discovered {len(leads)} lead(s). Starting research...", 40)
+    print(f"[LeadFinder] Got {len(search_results)} unique result(s) across all queries.")
 
-    # ── Step 2: Research each lead ────────────────────────────────────────
-    researched_leads = []
+    # ── Step 2: AI extracts candidates ─────────────────────────────────────
+    _notify(f"Analysing {len(search_results)} results with AI...", 30)
+    candidates = _extract_candidates(criteria, search_results, max_results * 2)
 
-    for index, lead in enumerate(leads):
-        company = lead.get("company_name", "unknown")
-        progress = 40 + int((index / len(leads)) * 50)  # 40% → 90%
+    if not candidates:
+        _notify("No candidate companies identified.", 35)
+        return []
+
+    print(f"[LeadFinder] AI returned {len(candidates)} candidate(s).")
+
+    # ── Step 3: Deduplicate ─────────────────────────────────────────────────
+    _notify("Deduplicating candidates...", 35)
+    candidates = _deduplicate_candidates(candidates)
+    candidates = candidates[:max_results]
+    print(f"[LeadFinder] After deduplication: {len(candidates)} candidate(s).")
+
+    # ── Step 4: Research, score, detect opportunities ───────────────────────
+    final_leads: list[dict] = []
+    total = len(candidates)
+
+    for index, candidate in enumerate(candidates):
+        company = candidate.get("company_name", "unknown")
+        # Progress: 40% -> 90% spread across candidates
+        pct_start = 40 + int((index / total) * 50)
+        pct_end   = 40 + int(((index + 1) / total) * 50)
 
         _notify(
-            f"Researching lead {index + 1}/{len(leads)}: {company}...",
-            progress,
+            f"Researching {index + 1}/{total}: {company}...",
+            pct_start,
         )
 
-        research_raw = research_lead(lead)
+        # Check DB cache — skip re-research if recently done.
+        norm = normalize_domain(
+            candidate.get("website") or candidate.get("source_url") or company
+        )
+        cached = get_company_by_domain(norm) if norm else None
 
-        # Strip fences from researcher output too.
-        research_cleaned = clean_json_response(research_raw)
+        if cached:
+            print(f"[LeadFinder] '{company}' already in DB (id={cached['id']}). Using cached.")
+            _notify(f"Using cached data for {company}.", pct_start)
+        else:
+            cached = None  # explicit None = do fresh research
 
         try:
-            research_data = json.loads(research_cleaned)
-        except json.JSONDecodeError as exc:
-            # Log the actual bad response so we can see what went wrong.
-            print(
-                f"[LeadFinder] WARNING: Lead Researcher returned invalid JSON "
-                f"for '{company}': {exc}\n"
-                f"  Raw (first 300 chars): {research_raw[:300]!r}"
+            lead_dict = _process_one_candidate(
+                candidate=candidate,
+                criteria=criteria,
+                job_id=job_id,
+                cached_company=cached,
             )
-            continue
+            if lead_dict:
+                final_leads.append(lead_dict)
+                _notify(
+                    f"Completed {company} — score {lead_dict.get('score', 0)}/100.",
+                    pct_end,
+                )
 
-        researched_leads.append(research_data)
+        except Exception as exc:
+            print(
+                f"[LeadFinder] ERROR processing '{company}': {exc}\n"
+                f"{traceback.format_exc()}"
+            )
+            _notify(f"WARNING️ Failed to process {company} (continuing...).", pct_start)
+            # Continue — one bad lead should not abort the whole job.
 
     _notify(
-        f"Research complete. {len(researched_leads)} lead(s) ready.",
+        f"Research complete. {len(final_leads)}/{total} lead(s) ready.",
         90,
     )
+    return final_leads
 
-    return researched_leads
+
+# ---------------------------------------------------------------------------
+# Internal steps
+# ---------------------------------------------------------------------------
+
+def _build_discovery_queries(criteria: str) -> list[str]:
+    """Build 2–3 targeted search queries from user criteria."""
+    base = criteria.strip()
+    queries = [
+        base,
+        f"top {base} companies list",
+    ]
+    # Add a "near me" style query only if a location is implied.
+    if any(loc in base.lower() for loc in ["india", "delhi", "mumbai", "bangalore",
+                                             "chennai", "hyderabad", "pune", "kolkata",
+                                             "uk", "usa", "london", "dubai", "uae"]):
+        queries.append(f"best {base} businesses reviews")
+    return queries
+
+
+def _extract_candidates(
+    criteria: str,
+    search_results: list[dict],
+    limit: int,
+) -> list[dict]:
+    """Use Gemini to extract candidate companies from raw search results."""
+
+    results_text = json.dumps(search_results[:20], indent=2)  # cap to keep prompt size
+
+    prompt = f"""
+{DISCOVERY_PROMPT}
+
+User's lead criteria: {criteria!r}
+
+Web search results:
+{results_text}
+
+Extract up to {limit} matching companies.
+Return ONLY the JSON object.
+"""
+
+    try:
+        raw = ask_ai_json(prompt)
+        validated = CandidateList.model_validate(raw)
+        return [c.model_dump() for c in validated.leads]
+
+    except (ValidationError, ValueError) as exc:
+        print(f"[LeadFinder] Candidate extraction failed: {exc}")
+        return []
+
+    except Exception as exc:
+        print(f"[LeadFinder] Unexpected error in extraction: {exc}")
+        return []
+
+
+def _deduplicate_candidates(candidates: list[dict]) -> list[dict]:
+    """
+    Remove duplicate companies.
+
+    Deduplication keys (in priority order):
+      1. Normalized domain of website URL
+      2. Normalized company name
+    """
+    seen: set[str] = set()
+    unique: list[dict] = []
+
+    for c in candidates:
+        # Try website domain first.
+        website = c.get("website", "").strip()
+        key = normalize_domain(website) if website else ""
+
+        # Fall back to normalized company name.
+        if not key:
+            key = normalize_domain(c.get("company_name", ""))
+
+        if not key:
+            unique.append(c)
+            continue
+
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+        else:
+            print(f"[LeadFinder] Duplicate removed: {c.get('company_name')} ({key})")
+
+    return unique
+
+
+def _process_one_candidate(
+    candidate: dict,
+    criteria: str,
+    job_id: Optional[str],
+    cached_company: Optional[dict],
+) -> Optional[dict]:
+    """
+    Research, score, and detect opportunities for a single candidate.
+    Returns an enriched lead dict, or None on unrecoverable failure.
+    """
+
+    company_name = candidate.get("company_name", "")
+    industry     = candidate.get("industry", "")
+    website      = candidate.get("website", "")
+    company_info = candidate.get("company_info", "")
+
+    # 1. Research
+    research = research_lead(candidate)
+
+    # Populate missing fields from research output.
+    resolved_website  = research.get("website", "") or website
+    resolved_industry = research.get("industry", "") or industry
+    resolved_location = research.get("location", "")
+    resolved_summary  = research.get("company_summary", "") or company_info
+
+    # 2. Score
+    scoring = score_lead(research, original_criteria=criteria)
+    score        = scoring.get("total_score", 0)
+    score_breakdown  = scoring.get("scores", {})
+    score_reasoning  = scoring.get("score_reasoning", "")
+    why_good_lead    = scoring.get("why_good_lead", "")
+
+    # 3. Detect opportunities
+    opportunities = detect_opportunities(research)
+
+    # 4. Persist to DB
+    norm_domain = normalize_domain(resolved_website or company_name)
+
+    company_id = upsert_company(
+        name=company_name,
+        normalized_domain=norm_domain,
+        website=resolved_website,
+        industry=resolved_industry,
+        location=resolved_location,
+        description=resolved_summary,
+    )
+
+    sources = research.get("sources", [])
+
+    lead_id = save_full_lead(
+        company_id=company_id,
+        job_id=job_id,
+        score=score,
+        score_breakdown=score_breakdown,
+        score_reasoning=score_reasoning,
+        why_good_lead=why_good_lead,
+        research_json=research,
+        opportunities=opportunities,
+        sources=sources,
+    )
+
+    # 5. Build the dict that goes into the job's "leads" field
+    #    (what the frontend receives from GET /jobs/{job_id}).
+    return {
+        "lead_id":        lead_id,
+        "company_id":     company_id,
+        "company_name":   company_name,
+        "website":        resolved_website,
+        "industry":       resolved_industry,
+        "location":       resolved_location,
+        "company_summary": resolved_summary,
+        "score":          score,
+        "score_breakdown": score_breakdown,
+        "score_reasoning": score_reasoning,
+        "why_good_lead":  why_good_lead,
+        "opportunities":  opportunities,
+        "sources":        sources,
+        # Flatten some research facts for the frontend card.
+        "products_or_services": research.get("facts", {}).get("products_or_services", []),
+        "online_booking":       research.get("facts", {}).get("online_booking_present", False),
+        "whatsapp":             research.get("facts", {}).get("whatsapp_contact_present", False),
+        "research":             research,
+    }

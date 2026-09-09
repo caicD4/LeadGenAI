@@ -1,8 +1,25 @@
+"""
+LeadGenAI — Orchestrator.
+
+Drives the complete lead-generation workflow with granular progress updates.
+
+Progress milestones
+-------------------
+ 10%  Starting
+ 15%  Building queries
+ 20%  Searching the web
+ 30%  Extracting candidates
+ 35%  Deduplicating
+ 40–90% Researching companies (spread across candidates)
+ 90%  Finalizing
+ 95%  Saving job metadata
+100%  Complete
+"""
+
 import traceback
 
 from agents.lead_finder import find_and_research_leads
 from core.job_manager import update_job
-from database.database import save_lead
 
 
 def run_lead_generation(
@@ -11,29 +28,20 @@ def run_lead_generation(
     job_id: str = None,
 ) -> list[dict]:
     """
-    Run the complete LeadGenAI lead-generation workflow.
-
-    Flow:
-        criteria
-            ↓
-        lead discovery  (web search + AI)
-            ↓
-        lead research   (web search + AI, per lead)
-            ↓
-        database storage
-            ↓
-        return leads
+    Run the complete LeadGenAI workflow.
 
     Args:
         criteria:    Natural-language lead criteria from the user.
         max_results: Maximum number of leads to find and research.
-        job_id:      If provided, updates job progress during execution.
+        job_id:      If provided, pushes live progress to the job manager.
+
+    Returns:
+        List of enriched lead dicts.
     """
 
     def on_progress(message: str, progress: int = None):
-        """Push live progress updates to the job manager."""
+        """Push a progress update to the job manager (and always log it)."""
         print(f"[Orchestrator] {message}")
-
         if job_id is not None and progress is not None:
             update_job(
                 job_id,
@@ -42,55 +50,32 @@ def run_lead_generation(
                 message=message,
             )
 
-    print("\n[Orchestrator] Starting lead generation...")
-    print(f"[Orchestrator] Criteria: {criteria!r}")
+    print("\n[Orchestrator] ============================================")
+    print(f"[Orchestrator] Starting lead generation")
+    print(f"[Orchestrator] Criteria   : {criteria!r}")
     print(f"[Orchestrator] Max results: {max_results}")
+    print(f"[Orchestrator] Job ID     : {job_id or '(none)'}")
+    print("[Orchestrator] ============================================\n")
 
-    # ── 1. Find and research leads ─────────────────────────────────────────
+    on_progress("Starting lead generation...", 10)
+
     try:
         leads = find_and_research_leads(
-            criteria,
+            criteria=criteria,
             max_results=max_results,
+            job_id=job_id,
             on_progress=on_progress,
         )
+
     except Exception as exc:
-        # Re-raise with a clear message so job_manager surfaces it.
-        print(f"[Orchestrator] Lead generation failed: {exc}")
+        msg = f"Lead generation failed: {type(exc).__name__}: {exc}"
+        print(f"[Orchestrator] ERROR: {msg}")
         print(traceback.format_exc())
-        raise RuntimeError(
-            f"Lead generation failed: {exc}"
-        ) from exc
+        # Re-raise so job_manager marks the job as "failed".
+        raise RuntimeError(msg) from exc
 
-    if not leads:
-        print("[Orchestrator] No leads found.")
-        on_progress("No leads found.", 95)
-        return []
-
-    print(f"[Orchestrator] Found and researched {len(leads)} lead(s).")
-    on_progress(f"Saving {len(leads)} lead(s) to database...", 92)
-
-    # ── 2. Save every lead to the database ─────────────────────────────────
-    for lead in leads:
-        company_name = lead.get("company_name", "Unknown")
-        industry = lead.get("industry", "")
-        company_summary = lead.get("company_summary", "")
-
-        try:
-            save_lead(
-                company_name,
-                industry,
-                company_summary,
-                str(lead),
-            )
-            print(f"[Orchestrator] Saved: {company_name}")
-
-        except Exception as exc:
-            # Non-fatal: log the error but continue saving other leads.
-            print(
-                f"[Orchestrator] WARNING: Failed to save '{company_name}': {exc}"
-            )
-
-    print("[Orchestrator] Workflow complete.")
-    on_progress("All leads saved.", 98)
+    count = len(leads) if leads else 0
+    print(f"[Orchestrator] Pipeline complete — {count} lead(s) produced.")
+    on_progress(f"All {count} lead(s) researched and scored.", 95)
 
     return leads

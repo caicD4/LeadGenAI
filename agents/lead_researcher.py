@@ -1,141 +1,263 @@
+"""
+LeadGenAI — Lead Researcher.
+
+Researches a single company using an iterative web-search loop.
+
+Research loop (max 2 iterations):
+  1. Primary search: company name + industry + "services"
+  2. AI extracts structured facts.
+  3. If critical fields (website, services) still missing -> second search.
+  4. AI merges and finalises.
+
+Output clearly separates FACTS (from search results) from INFERENCES
+(logical conclusions that are not directly stated).
+"""
+
 import json
+import traceback
+from typing import Optional
 
-from config.ollama_client import ask_ai, clean_json_response
-from tools.web_search import search_web
+from config.ollama_client import ask_ai_json
+from tools.web_search import multi_search, search_web, WebSearchError
 
 
-SYSTEM_PROMPT = """
+# ---------------------------------------------------------------------------
+# Prompt
+# ---------------------------------------------------------------------------
+
+RESEARCH_PROMPT = """
 You are the Lead Researcher for LeadGenAI.
 
-Your job is to deeply research a specific business using real web search
-results provided to you.
+Research a specific company using ONLY the web search results provided.
 
-The provided web search results are the ONLY source of factual information
-you may use.
+CRITICAL RULES:
+- Do NOT invent facts.
+- Every claim in "facts" must be directly supported by the search results.
+- Inferences are allowed in "inferences" only — clearly label them as logical
+  conclusions that follow from the facts, not as confirmed facts.
+- If information is not available, use empty string / empty array.
+- Return ONLY valid JSON. No markdown. No code fences.
 
-IMPORTANT:
-- Do not invent facts.
-- Do not use your own knowledge.
-- Every factual claim must be supported by the search results.
-- If information is not available, use an empty string or empty array.
-- Clearly separate factual observations from potential opportunities.
-- Return ONLY valid JSON — no markdown, no explanation, no code fences.
+FACT vs INFERENCE:
+  FACT:      "The company's website has an online booking button."
+  INFERENCE: "This suggests they receive appointment requests that could be automated."
 
-Use exactly this structure:
+Required JSON structure:
 
 {
-    "company_name": "",
-    "industry": "",
-    "company_summary": "",
-    "products_or_services": [],
-    "target_customers": [],
-    "business_problems_or_needs": [],
-    "potential_service_opportunities": [],
-    "important_observations": [],
-    "sources": [
-        {
-            "title": "",
-            "url": ""
-        }
-    ]
+  "company_name":    "",
+  "website":         "",
+  "industry":        "",
+  "location":        "",
+  "company_summary": "",
+  "facts": {
+    "products_or_services":     [],
+    "target_customers":         [],
+    "number_of_locations":      "",
+    "company_size_signals":     [],
+    "online_booking_present":   false,
+    "whatsapp_contact_present": false,
+    "contact_channels":         [],
+    "social_media_presence":    [],
+    "notable_observations":     []
+  },
+  "inferences": {
+    "potential_pain_points":    [],
+    "automation_readiness":     "",
+    "growth_signals":           []
+  },
+  "sources": [
+    {"title": "", "url": "", "snippet": ""}
+  ]
 }
-
-Rules:
-
-- company_name must match the researched company.
-- industry must be supported by the search results.
-- company_summary must contain only supported facts.
-- products_or_services must contain only things explicitly supported by
-  the search results.
-- target_customers must be supported by the search results.
-- business_problems_or_needs must only contain problems or needs supported
-  by the evidence.
-- potential_service_opportunities are opportunities that could reasonably
-  follow from the evidence. Do not present them as facts about the company.
-- important_observations should contain useful factual findings from the
-  research.
-- sources must contain the URLs used as evidence.
-- Do not fabricate URLs.
-- Return no explanation outside the JSON.
-- Do NOT wrap your response in markdown code fences.
 """
 
 
-def research_lead(lead: dict) -> str:
+# ---------------------------------------------------------------------------
+# Public function
+# ---------------------------------------------------------------------------
+
+def research_lead(lead: dict) -> dict:
     """
-    Research a specific lead using a focused web search + AI analysis.
+    Research a company and return a structured research dict.
+
+    Uses an iterative search loop (max 2 iterations).
+    Never raises — returns a partial or stub result on any failure.
+
+    Args:
+        lead: Dict with at least "company_name"; optionally "industry",
+              "website", "company_info".
+
+    Returns:
+        Structured research dict (see RESEARCH_PROMPT for schema).
     """
 
-    company_name = lead.get("company_name", "")
-    industry = lead.get("industry", "")
-    company_info = lead.get("company_info", "")
+    company_name = lead.get("company_name", "").strip()
+    industry     = lead.get("industry", "").strip()
+    website      = lead.get("website", "").strip() or lead.get("source_url", "").strip()
+    company_info = lead.get("company_info", "").strip()
 
     if not company_name:
-        return json.dumps({
-            "error": "company_name is required"
-        })
+        return _stub("", "company_name is required", [])
 
-    # ── Web Search ─────────────────────────────────────────────────────────
-    # Use a single, focused query to reduce API calls and latency.
-    # Previously this made 3 separate queries (9 results) per lead —
-    # now it makes 1 broader query (5 results).
-    search_query = f"{company_name} {industry} company overview products services"
+    print(f"[LeadResearcher] Starting research: {company_name!r}")
 
-    print(f"[LeadResearcher] Searching for: {search_query!r}")
+    # ── Iteration 1 ──────────────────────────────────────────────────────────
+    queries_1 = _build_queries(company_name, industry, website, iteration=1)
+    results_1 = _safe_multi_search(queries_1, max_results=5)
 
-    results = search_web(search_query, max_results=5)
+    if not results_1:
+        print(f"[LeadResearcher] No search results for '{company_name}'. Returning stub.")
+        return _stub(company_name, company_info, [])
 
-    if not results:
-        print(f"[LeadResearcher] No results for '{company_name}', returning stub.")
-        return json.dumps({
-            "company_name": company_name,
-            "industry": industry,
-            "company_summary": company_info,
-            "products_or_services": [],
-            "target_customers": [],
-            "business_problems_or_needs": [],
-            "potential_service_opportunities": [],
-            "important_observations": [],
-            "sources": []
-        })
+    research = _run_research_ai(
+        company_name, industry, company_info, results_1
+    )
 
-    # Remove duplicate URLs just in case.
-    unique_results = []
-    seen_urls: set[str] = set()
+    # ── Iteration 2 (if needed) ───────────────────────────────────────────────
+    website_found  = bool(research.get("website", "").strip())
+    services_found = bool(research.get("facts", {}).get("products_or_services"))
 
-    for result in results:
-        url = result.get("url")
+    if not website_found or not services_found:
+        print(
+            f"[LeadResearcher] Iteration 2 for '{company_name}' "
+            f"(website_found={website_found}, services_found={services_found})"
+        )
 
-        if url and url not in seen_urls:
-            seen_urls.add(url)
-            unique_results.append(result)
+        queries_2 = _build_queries(company_name, industry, website, iteration=2)
+        results_2 = _safe_multi_search(queries_2, max_results=5)
 
-    results_text = json.dumps(unique_results, indent=2)
+        if results_2:
+            # Merge unique results from both iterations.
+            merged = _merge_results(results_1, results_2)
+            research = _run_research_ai(
+                company_name, industry, company_info, merged
+            )
 
-    # ── AI Analysis ────────────────────────────────────────────────────────
+    print(
+        f"[LeadResearcher] Done: {company_name!r} — "
+        f"website={research.get('website', '')!r}, "
+        f"services={len(research.get('facts', {}).get('products_or_services', []))} items"
+    )
+    return research
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _build_queries(
+    company_name: str,
+    industry: str,
+    website: str,
+    iteration: int,
+) -> list[str]:
+    """Build focused search queries for each research iteration."""
+
+    if iteration == 1:
+        q1 = f"{company_name} {industry} company overview services"
+        q2 = f"{company_name} about us products location contact"
+        return [q1, q2]
+
+    else:  # iteration 2 — look for more specific details
+        q1 = f"{company_name} {industry} booking appointment WhatsApp"
+        q2 = f"\"{company_name}\" website reviews"
+        return [q1, q2]
+
+
+def _safe_multi_search(queries: list[str], max_results: int = 5) -> list[dict]:
+    """Run multi_search and return empty list on any error."""
+    try:
+        return multi_search(queries, max_results_per_query=max_results)
+    except Exception as exc:
+        print(f"[LeadResearcher] Search error: {exc}")
+        return []
+
+
+def _run_research_ai(
+    company_name: str,
+    industry: str,
+    company_info: str,
+    search_results: list[dict],
+) -> dict:
+    """Send search results to Gemini and parse the structured research output."""
+
+    results_text = json.dumps(search_results, indent=2)
+
     prompt = f"""
-{SYSTEM_PROMPT}
+{RESEARCH_PROMPT}
 
-Lead to research:
+Company to research:
+{{
+  "company_name":  {json.dumps(company_name)},
+  "industry":      {json.dumps(industry)},
+  "company_info":  {json.dumps(company_info)}
+}}
 
-{json.dumps({
-    "company_name": company_name,
-    "industry": industry,
-    "company_info": company_info
-}, indent=2)}
-
-Web research results:
-
+Web search results:
 {results_text}
 
 Research this company using ONLY the provided evidence.
-
-Return ONLY the JSON object. Do NOT use markdown code fences.
+Return ONLY the JSON object.
 """
 
-    print(f"[LeadResearcher] Sending research prompt for '{company_name}' to AI...")
-    raw = ask_ai(prompt)
-    print(f"[LeadResearcher] AI responded for '{company_name}' ({len(raw)} chars).")
+    try:
+        result = ask_ai_json(prompt)
+        # Always enforce the company name from the original lead.
+        result["company_name"] = company_name
+        return result
 
-    # Strip markdown code fences before returning.
-    return clean_json_response(raw)
+    except Exception as exc:
+        print(
+            f"[LeadResearcher] AI research failed for '{company_name}': {exc}\n"
+            f"{traceback.format_exc()}"
+        )
+        return _stub(company_name, company_info, search_results)
+
+
+def _merge_results(
+    results_1: list[dict],
+    results_2: list[dict],
+) -> list[dict]:
+    """Merge two result lists, deduplicating by URL."""
+    seen: set[str] = set()
+    merged: list[dict] = []
+
+    for r in results_1 + results_2:
+        url = r.get("url", "")
+        if url and url not in seen:
+            seen.add(url)
+            merged.append(r)
+
+    return merged
+
+
+def _stub(company_name: str, company_info: str, sources: list[dict]) -> dict:
+    """Return a safe empty-research stub."""
+    return {
+        "company_name":    company_name,
+        "website":         "",
+        "industry":        "",
+        "location":        "",
+        "company_summary": company_info or "",
+        "facts": {
+            "products_or_services":     [],
+            "target_customers":         [],
+            "number_of_locations":      "",
+            "company_size_signals":     [],
+            "online_booking_present":   False,
+            "whatsapp_contact_present": False,
+            "contact_channels":         [],
+            "social_media_presence":    [],
+            "notable_observations":     [],
+        },
+        "inferences": {
+            "potential_pain_points": [],
+            "automation_readiness":  "",
+            "growth_signals":        [],
+        },
+        "sources": [
+            {"title": s.get("title", ""), "url": s.get("url", ""), "snippet": s.get("snippet", "")}
+            for s in sources[:5]
+        ],
+    }

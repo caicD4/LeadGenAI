@@ -115,13 +115,13 @@ def _run_job(job_id: str, function, args, kwargs):
             result,
         )
 
-        print(f"[JobManager] Job {short} → completed ✓")
+        print(f"[JobManager] Job {short} -> completed")
 
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
         full_trace = traceback.format_exc()
 
-        print(f"[JobManager] Job {short} → FAILED: {error_msg}")
+        print(f"[JobManager] Job {short} -> FAILED: {error_msg}")
         print(full_trace)
 
         update_job(

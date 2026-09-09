@@ -1,3 +1,11 @@
+"""
+Gemini AI client for LeadGenAI.
+
+This module is intentionally named ollama_client.py (legacy name) to avoid
+breaking existing imports.  All AI calls now go through Google Gemini.
+"""
+
+import json
 import os
 import time
 
@@ -7,7 +15,8 @@ from google.genai import errors as genai_errors
 
 load_dotenv()
 
-# gemini-3.5-flash-lite: high free-tier quota, fast, good for structured JSON.
+# gemini-3.5-flash-lite: fast, cost-effective, confirmed available for this key.
+# (gemini-2.0-flash-lite and gemini-2.5-flash are deprecated/unavailable)
 MODEL = "gemini-3.5-flash-lite"
 
 # How many times to retry on transient errors (429 rate-limit, 503 overload).
@@ -65,7 +74,7 @@ def ask_ai(prompt: str) -> str:
                 last_exc = exc
                 continue
 
-            raise RuntimeError(f"Gemini API call failed: {exc}") from exc
+            raise RuntimeError(f"Gemini API call failed (HTTP {status}): {exc}") from exc
 
         except Exception as exc:
             raise RuntimeError(f"Gemini API call failed: {exc}") from exc
@@ -73,6 +82,42 @@ def ask_ai(prompt: str) -> str:
     raise RuntimeError(
         f"Gemini API call failed after {_MAX_RETRIES} retries: {last_exc}"
     ) from last_exc
+
+
+def ask_ai_json(prompt: str) -> dict:
+    """
+    Send a prompt to Gemini, parse the response as JSON, and return the dict.
+
+    The prompt should instruct the model to return only JSON.
+    This function strips markdown code fences and re-tries once on bad JSON.
+
+    Raises:
+        ValueError: If the response cannot be parsed as JSON after cleaning.
+        RuntimeError: If the underlying Gemini call fails.
+    """
+
+    raw = ask_ai(prompt)
+    cleaned = clean_json_response(raw)
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Second attempt: ask Gemini to fix its own output.
+        fix_prompt = (
+            "The following text was supposed to be valid JSON but is not.\n"
+            "Return ONLY the corrected valid JSON with no explanation and no code fences:\n\n"
+            + cleaned[:2000]
+        )
+        raw2 = ask_ai(fix_prompt)
+        cleaned2 = clean_json_response(raw2)
+        try:
+            return json.loads(cleaned2)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Gemini returned non-JSON after two attempts.\n"
+                f"First response (first 300 chars): {raw[:300]!r}\n"
+                f"Error: {exc}"
+            ) from exc
 
 
 def clean_json_response(raw: str) -> str:
