@@ -33,8 +33,33 @@ def get_connection() -> sqlite3.Connection:
 
 
 # ---------------------------------------------------------------------------
-# Domain normalisation (used for deduplication)
+# Domain normalisation & deduplication keys
 # ---------------------------------------------------------------------------
+
+KNOWN_AGGREGATORS = {
+    "clutch.co", "g2.com", "yelp.com", "practo.com", "justdial.com",
+    "tripadvisor.com", "cureindia.com", "forbes.com", "yellowpages.com",
+    "trustpilot.com", "linkedin.com", "facebook.com", "instagram.com",
+    "wikipedia.org", "google.com", "glassdoor.com", "indeed.com",
+    "bark.com", "upwork.com", "fiverr.com", "medium.com", "quora.com",
+    "reddit.com", "capterra.com", "softwareadvice.co", "softwareadvice.com",
+    "goodfirms.co", "entrepreneur.com", "crunchbase.com", "mordorintelligence.com",
+    "statista.com", "grandviewresearch.com", "verifiedmarketresearch.com"
+}
+
+
+def is_aggregator_domain(url_or_domain: str) -> bool:
+    """Return True if the domain/URL belongs to a directory, aggregator, or social platform."""
+    if not url_or_domain:
+        return True
+    norm = normalize_domain(url_or_domain)
+    for agg in KNOWN_AGGREGATORS:
+        if norm == agg or norm.endswith("." + agg):
+            return True
+    if any(k in norm for k in ["intelligence", "marketresearch", "researchandmarkets", "directory", "top10", "listings", "yellowpages"]):
+        return True
+    return False
+
 
 def normalize_domain(url_or_name: str) -> str:
     """
@@ -64,6 +89,25 @@ def normalize_domain(url_or_name: str) -> str:
     s = re.sub(r"\s+", "-", s.strip())
 
     return s
+
+
+def get_company_dedup_key(website: str, company_name: str, fallback_url: str = "") -> str:
+    """
+    Produce a canonical deduplication key for a company.
+
+    If `website` is present and NOT a known directory/aggregator, use its normalized domain.
+    Otherwise, fall back to the normalized `company_name`.
+    """
+    web_norm = normalize_domain(website)
+    if web_norm and not is_aggregator_domain(web_norm):
+        return web_norm
+
+    # If website is missing or points to an aggregator, deduplicate by normalized company_name.
+    # We deliberately do not use fallback_url here because candidates from the same search result
+    # page share the same fallback_url.
+    return normalize_domain(company_name)
+
+
 
 
 # ---------------------------------------------------------------------------

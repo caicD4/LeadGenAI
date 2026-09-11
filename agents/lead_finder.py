@@ -15,6 +15,7 @@ Discovery pipeline:
 
 import json
 import re
+import time
 import traceback
 from typing import Callable, List, Optional
 
@@ -26,6 +27,7 @@ from agents.opportunity_detector import detect_opportunities
 from config.ollama_client import ask_ai_json, clean_json_response
 from database.database import (
     get_company_by_domain,
+    get_company_dedup_key,
     normalize_domain,
     save_full_lead,
     upsert_company,
@@ -58,10 +60,11 @@ class CandidateList(BaseModel):
 DISCOVERY_PROMPT = """
 You are the Lead Finder for LeadGenAI.
 
-Your job is to extract named, real companies from web search results that
+Your job is to extract ALL distinct, real companies from web search results that
 match the user's lead criteria.
 
 RULES:
+- Extract MULTIPLE distinct matching companies (extract as many unique ones as found in search results, up to the limit).
 - Use search results as the primary evidence source.
 - You may use general knowledge for well-known companies referenced or
   implied by the results.
@@ -77,9 +80,18 @@ Required structure:
 {
   "leads": [
     {
-      "company_name": "",
+      "company_name": "Company A",
       "industry":     "",
-      "website":      "",
+      "website":      "https://example-a.com",
+      "company_info": "",
+      "source_url":   "",
+      "source_title": "",
+      "evidence":     ""
+    },
+    {
+      "company_name": "Company B",
+      "industry":     "",
+      "website":      "https://example-b.com",
       "company_info": "",
       "source_url":   "",
       "source_title": "",
@@ -152,6 +164,10 @@ def find_and_research_leads(
 
     for index, candidate in enumerate(candidates):
         company = candidate.get("company_name", "unknown")
+        # Pace requests between candidates to prevent Gemini API 429 rate limiting
+        if index > 0:
+            time.sleep(1.5)
+
         # Progress: 40% -> 90% spread across candidates
         pct_start = 40 + int((index / total) * 50)
         pct_end   = 40 + int(((index + 1) / total) * 50)
@@ -162,9 +178,9 @@ def find_and_research_leads(
         )
 
         # Check DB cache — skip re-research if recently done.
-        norm = normalize_domain(
-            candidate.get("website") or candidate.get("source_url") or company
-        )
+        website = candidate.get("website", "").strip()
+        source_url = candidate.get("source_url", "").strip()
+        norm = get_company_dedup_key(website, company, fallback_url=source_url)
         cached = get_company_by_domain(norm) if norm else None
 
         if cached:
@@ -258,23 +274,20 @@ Return ONLY the JSON object.
 
 def _deduplicate_candidates(candidates: list[dict]) -> list[dict]:
     """
-    Remove duplicate companies.
+    Remove duplicate companies using get_company_dedup_key.
 
-    Deduplication keys (in priority order):
-      1. Normalized domain of website URL
-      2. Normalized company name
+    Ignores generic aggregator domains (Clutch, Yelp, Practo, etc.) and empty websites,
+    falling back to company name for deduplication.
     """
     seen: set[str] = set()
     unique: list[dict] = []
 
     for c in candidates:
-        # Try website domain first.
         website = c.get("website", "").strip()
-        key = normalize_domain(website) if website else ""
+        company_name = c.get("company_name", "").strip()
+        source_url = c.get("source_url", "").strip()
 
-        # Fall back to normalized company name.
-        if not key:
-            key = normalize_domain(c.get("company_name", ""))
+        key = get_company_dedup_key(website, company_name, fallback_url=source_url)
 
         if not key:
             unique.append(c)
@@ -284,7 +297,7 @@ def _deduplicate_candidates(candidates: list[dict]) -> list[dict]:
             seen.add(key)
             unique.append(c)
         else:
-            print(f"[LeadFinder] Duplicate removed: {c.get('company_name')} ({key})")
+            print(f"[LeadFinder] Duplicate removed: {company_name} ({key})")
 
     return unique
 
@@ -325,7 +338,7 @@ def _process_one_candidate(
     opportunities = detect_opportunities(research)
 
     # 4. Persist to DB
-    norm_domain = normalize_domain(resolved_website or company_name)
+    norm_domain = get_company_dedup_key(resolved_website, company_name, fallback_url=candidate.get("source_url", ""))
 
     company_id = upsert_company(
         name=company_name,

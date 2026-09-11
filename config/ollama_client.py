@@ -60,23 +60,29 @@ def ask_ai(prompt: str) -> str:
             )
             return response.text
 
-        except genai_errors.ClientError as exc:
+        except Exception as exc:
+            err_msg = str(exc).lower()
             status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
 
-            # Retry on rate-limit (429) or server overload (503).
-            if status in (429, 503) and attempt < _MAX_RETRIES:
+            is_rate_limit = (
+                status in (429, 503)
+                or "429" in err_msg
+                or "resource_exhausted" in err_msg
+                or "rate" in err_msg
+                or "quota" in err_msg
+                or "overload" in err_msg
+            )
+
+            if is_rate_limit and attempt < _MAX_RETRIES:
                 wait = _BACKOFF_BASE * (2 ** (attempt - 1))  # 5, 10, 20, …
                 print(
-                    f"[Gemini] HTTP {status} on attempt {attempt}/{_MAX_RETRIES}."
+                    f"[Gemini] Rate-limit/overload detected on attempt {attempt}/{_MAX_RETRIES} ({exc})."
                     f" Retrying in {wait}s…"
                 )
                 time.sleep(wait)
                 last_exc = exc
                 continue
 
-            raise RuntimeError(f"Gemini API call failed (HTTP {status}): {exc}") from exc
-
-        except Exception as exc:
             raise RuntimeError(f"Gemini API call failed: {exc}") from exc
 
     raise RuntimeError(
